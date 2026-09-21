@@ -141,7 +141,8 @@ class TestZappa(unittest.TestCase):
         too_many_versions = z.rollback_lambda_function_version(function_name, 99999)
         self.assertFalse(too_many_versions)
 
-        function_arn = z.rollback_lambda_function_version(function_name, 1)
+        function_arn = z.rollback_lambda_function_version(
+            function_name, 1, restore_configuration=False)
 
     @placebo_session
     def test_invoke_lambda_function(self, session):
@@ -438,6 +439,11 @@ class TestZappa(unittest.TestCase):
         zappa_cli.authorization_type = 'NONE'
         zappa_cli.load_settings('test_settings.json', session)
         zappa_cli.zappa.credentials_arn = 'arn:aws:iam::12345:role/ZappaLambdaExecution'
+        # Placebo cassettes predate the deployment-lock/preflight API calls;
+        # those paths have their own dedicated unit tests.
+        zappa_cli.deployment_lock_enabled = False
+        zappa_cli.zappa.validate_iam_role = lambda *a, **k: []
+        zappa_cli.zappa.validate_deployer_permissions = lambda *a, **k: []
         zappa_cli.deploy()
         zappa_cli.update()
         zappa_cli.rollback(1)

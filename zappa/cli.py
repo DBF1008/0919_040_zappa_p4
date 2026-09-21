@@ -41,7 +41,10 @@ from click.globals import push_context
 from dateutil import parser
 from datetime import datetime, timedelta
 
-from .core import Zappa, logger, API_GATEWAY_REGIONS
+from .core import (Zappa, logger, API_GATEWAY_REGIONS,
+                   LambdaFunctionNotFound, IAMRoleValidationError,
+                   DeploymentLockError, DeploymentRollbackError,
+                   DEFAULT_DEPLOYMENT_LOCK_TIMEOUT)
 from .utilities import (check_new_version_available, detect_django_settings,
                   detect_flask_apps, parse_s3_url, human_size,
                   validate_name, InvalidAwsLambdaName, get_venv_from_python_version,
@@ -682,11 +685,95 @@ class ZappaCLI:
             with open(template_file, 'r') as out:
                 print(out.read())
 
+    def deployment_lock(self):
+        """
+        Context manager that serializes deploy/update/rollback for a single
+        stage/function via a DynamoDB-backed distributed lock.
+
+        No-op when 'deployment_lock_enabled' is false in the settings.
+        """
+        enabled = getattr(self, 'deployment_lock_enabled', True)
+
+        class _Lock(object):
+            def __init__(self_inner):
+                self_inner.holder = None
+
+            def __enter__(self_inner):
+                if not enabled or not getattr(self, 'zappa', None):
+                    return None
+                click.echo("Acquiring deployment lock for " +
+                           click.style(self.lambda_name, bold=True) + "..")
+                try:
+                    self_inner.holder = self.zappa.acquire_deployment_lock(
+                        lock_key=self.lambda_name,
+                        timeout=self.deployment_lock_timeout_seconds,
+                        wait_seconds=getattr(
+                            self, 'deployment_lock_wait_seconds', 0))
+                except DeploymentLockError as dle:
+                    raise ClickException(str(dle))
+                return self_inner.holder
+
+            def __exit__(self_inner, exc_type, exc_val, exc_tb):
+                if self_inner.holder is not None:
+                    try:
+                        self.zappa.release_deployment_lock(
+                            self.lambda_name, holder=self_inner.holder)
+                    except Exception as release_error:
+                        logger.warning(
+                            "Could not release deployment lock: %s",
+                            release_error)
+                # Never swallow the original exception.
+                return False
+
+        return _Lock()
+
     def deploy(self, source_zip=None):
         """
         Package your project, upload it to S3, register the Lambda function
         and create the API Gateway routes.
 
+        Wrapped with a distributed deployment lock (concurrent-deploy
+        protection) and automatic cleanup of any half-finished resources if
+        the deployment fails part-way through.
+        """
+        with self.deployment_lock():
+            self._deployment_created_lambda = False
+            try:
+                self._deploy_impl(source_zip=source_zip)
+            except (ClickException, LambdaFunctionNotFound,
+                    IAMRoleValidationError):
+                raise
+            except Exception as deploy_error:
+                # Roll back the half-finished deployment so the account is
+                # left in a clean state for the next attempt.
+                self._cleanup_failed_deploy()
+                raise ClickException(
+                    click.style("Deployment failed", fg="red", bold=True) +
+                    ": {}\n".format(deploy_error) +
+                    "Any half-finished resources were cleaned up. Fix the "
+                    "issue and run " + click.style("zappa deploy", bold=True) +
+                    " again.")
+
+    def _cleanup_failed_deploy(self):
+        """Best-effort teardown after a failed deployment."""
+        try:
+            s3_keys = []
+            if getattr(self, 'zip_path', None):
+                s3_keys.append(os.path.basename(self.zip_path))
+            self.zappa.cleanup_failed_deployment(
+                function_name=self.lambda_name,
+                created_lambda=getattr(self,
+                                       '_deployment_created_lambda', False),
+                s3_keys=s3_keys or None,
+                bucket_name=getattr(self, 's3_bucket_name', None))
+        except Exception as cleanup_error:  # pragma: no cover
+            logger.error("Post-failure cleanup itself errored: %s",
+                         cleanup_error)
+
+    def _deploy_impl(self, source_zip=None):
+        """
+        Package your project, upload it to S3, register the Lambda function
+        and create the API Gateway routes.
         """
 
         if not source_zip:
@@ -718,6 +805,23 @@ class ZappaCLI:
                             "https://github.com/Miserlou/Zappa#custom-aws-iam-roles-and-policies-for-deployment",
                             bold=True)
                         + '\n')
+
+            # Pre-flight: verify the execution role and deploying credentials
+            # actually have the permissions this deployment needs. Failing
+            # here means no resources are created at all.
+            try:
+                if not self.zappa.credentials_arn:
+                    self.zappa.get_credentials_arn()
+                for warning in self.zappa.validate_iam_role():
+                    click.echo(click.style("Warning:", fg="yellow") + " " +
+                               warning)
+                for warning in self.zappa.validate_deployer_permissions():
+                    click.echo(click.style("Warning:", fg="yellow") + " " +
+                               warning)
+            except IAMRoleValidationError as iv:
+                raise ClickException(
+                    click.style("Pre-flight IAM check failed", fg="red",
+                                bold=True) + ":\n{}".format(iv))
 
             # Create the Lambda Zip
             self.create_package()
@@ -784,6 +888,7 @@ class ZappaCLI:
                 kwargs['s3_key'] = handler_file
 
             self.lambda_arn = self.zappa.create_lambda_function(**kwargs)
+            self._deployment_created_lambda = True
 
         # Schedule events for this deployment
         self.schedule()
@@ -801,6 +906,13 @@ class ZappaCLI:
             self.zappa.deploy_lambda_alb(**kwargs)
 
         if self.use_apigateway:
+
+            # Pre-flight: the Lambda must exist before API Gateway
+            # resources/CloudFormation are provisioned against its ARN.
+            try:
+                self.zappa.assert_lambda_function_exists(self.lambda_name)
+            except LambdaFunctionNotFound as lnf:
+                raise ClickException(str(lnf))
 
             # Create and configure the API Gateway
             template = self.zappa.create_stack_template(
@@ -860,7 +972,81 @@ class ZappaCLI:
 
         click.echo(deployment_string)
 
-    def update(self, source_zip=None, no_upload=False):
+    def update(self, source_zip=None, no_upload=False, auto_rollback=True):
+        """
+        Repackage and update the function code and configuration.
+
+        Wrapped with the distributed deployment lock. When auto_rollback is
+        True (the default) and the new code/configuration cannot be applied,
+        the function is automatically rolled back to its previous version -
+        both code and configuration - instead of leaving the deployment in a
+        broken state.
+        """
+        with self.deployment_lock():
+            self._update_code_published = False
+            # Pre-flight: there must be an existing function to update, and
+            # the IAM role/deployer must still have adequate permissions.
+            try:
+                self.zappa.assert_lambda_function_exists(self.lambda_name)
+                if not self.zappa.credentials_arn:
+                    self.zappa.get_credentials_arn()
+                for warning in self.zappa.validate_iam_role():
+                    click.echo(click.style("Warning:", fg="yellow") + " " +
+                               warning)
+            except LambdaFunctionNotFound as lnf:
+                raise ClickException(str(lnf))
+            except IAMRoleValidationError as iv:
+                raise ClickException(
+                    click.style("Pre-flight IAM check failed", fg="red",
+                                bold=True) + ":\n{}".format(iv))
+
+            try:
+                self._update_impl(source_zip=source_zip,
+                                  no_upload=no_upload)
+            except (ClickException, LambdaFunctionNotFound,
+                    IAMRoleValidationError):
+                raise
+            except Exception as update_error:
+                if not auto_rollback:
+                    raise
+
+                if not getattr(self, '_update_code_published', False):
+                    # The new code was never published (e.g. the failure
+                    # happened during packaging/upload/update_function_code),
+                    # so the running function is untouched. Nothing to roll
+                    # back - just report the error.
+                    raise ClickException(
+                        click.style("Update failed", fg="red", bold=True) +
+                        ": {} (the live function was not changed).".format(
+                            update_error))
+
+                click.echo(click.style(
+                    "Update failed; rolling back code AND configuration to "
+                    "the previous revision..", fg="red", bold=True))
+                try:
+                    rolled_back_arn = \
+                        self.zappa.rollback_lambda_function_version(
+                            self.lambda_name,
+                            versions_back=1,
+                            restore_configuration=True)
+                    if not rolled_back_arn:
+                        raise DeploymentRollbackError(
+                            "rollback reported no available revision")
+                except Exception as rollback_error:
+                    raise ClickException(
+                        click.style("Update failed AND automatic rollback "
+                                    "failed", fg="red", bold=True) +
+                        ".\nUpdate error: {}\nRollback error: {}\nManual "
+                        "intervention is required.".format(
+                            update_error, rollback_error))
+
+                raise ClickException(
+                    click.style("Update failed", fg="red", bold=True) +
+                    ": {} - the function was automatically rolled back to "
+                    "the previous revision (code and configuration).".format(
+                        update_error))
+
+    def _update_impl(self, source_zip=None, no_upload=False):
         """
         Repackage and update the function code.
         """
@@ -959,6 +1145,9 @@ class ZappaCLI:
             if not no_upload:
                 kwargs['s3_key'] = handler_file
                 self.lambda_arn = self.zappa.update_lambda_function(**kwargs)
+        # The new code was published; if anything below fails we have a
+        # previous revision to roll back to.
+        self._update_code_published = True
 
         # Remove the uploaded zip from S3, because it is now registered..
         if not source_zip and not no_upload:
@@ -1065,14 +1254,25 @@ class ZappaCLI:
 
     def rollback(self, revision):
         """
-        Rollsback the currently deploy lambda code to a previous revision.
+        Roll back the currently deployed lambda to a previous revision,
+        restoring both code and configuration.
         """
+        with self.deployment_lock():
+            try:
+                self.zappa.assert_lambda_function_exists(self.lambda_name)
+            except LambdaFunctionNotFound as lnf:
+                raise ClickException(str(lnf))
 
-        print("Rolling back..")
-
-        self.zappa.rollback_lambda_function_version(
-            self.lambda_name, versions_back=revision)
-        print("Done!")
+            print("Rolling back code and configuration..")
+            result = self.zappa.rollback_lambda_function_version(
+                self.lambda_name,
+                versions_back=revision,
+                restore_configuration=True)
+            if not result:
+                raise ClickException(
+                    "Could not roll back {} revision(s); not enough "
+                    "published versions exist.".format(revision))
+            print("Done!")
 
     def tail(self, since, filter_pattern, limit=10000, keep_open=True, colorize=True, http=False, non_http=False, force_colorize=False):
         """
@@ -2069,6 +2269,17 @@ class ZappaCLI:
             raise ClickException("Please supply either an integer or null for num_retained_versions in the zappa_settings.json. Found %s" % type(self.num_retained_versions))
         elif type(self.num_retained_versions) is int and self.num_retained_versions<1:
             raise ClickException("The value for num_retained_versions in the zappa_settings.json should be greater than 0.")
+
+        # Distributed deployment lock, preventing two concurrent
+        # `zappa deploy`/`update` invocations from creating two parallel
+        # CloudFormation stacks and conflicting resources.
+        self.deployment_lock_enabled = self.stage_config.get(
+            'deployment_lock_enabled', True)
+        self.deployment_lock_timeout_seconds = self.stage_config.get(
+            'deployment_lock_timeout_seconds',
+            DEFAULT_DEPLOYMENT_LOCK_TIMEOUT)
+        self.deployment_lock_wait_seconds = self.stage_config.get(
+            'deployment_lock_wait_seconds', 0)
 
         # Provide legacy support for `use_apigateway`, now `apigateway_enabled`.
         # https://github.com/Miserlou/Zappa/issues/490

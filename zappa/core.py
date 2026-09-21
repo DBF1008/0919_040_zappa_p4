@@ -50,6 +50,41 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 ##
+# Deployment Safety Exceptions
+##
+
+class ZappaDeploymentError(Exception):
+    """Base class for deployment safety errors."""
+    pass
+
+
+class LambdaFunctionNotFound(ZappaDeploymentError):
+    """Raised when a required Lambda function cannot be found."""
+    pass
+
+
+class IAMRoleValidationError(ZappaDeploymentError):
+    """Raised when the IAM execution role is missing or misconfigured."""
+    pass
+
+
+class DeploymentLockError(ZappaDeploymentError):
+    """Raised when another deployment holds the deployment lock."""
+    pass
+
+
+class DeploymentRollbackError(ZappaDeploymentError):
+    """Raised when a deployment cannot be rolled back after a failure."""
+    pass
+
+
+# Name of the DynamoDB table used for distributed deployment locks.
+DEPLOYMENT_LOCK_TABLE_NAME = 'zappa-deployment-locks'
+# Default lock TTL in seconds. A crashed/aborted deployment releases itself
+# automatically once the TTL expires.
+DEFAULT_DEPLOYMENT_LOCK_TIMEOUT = 900
+
+##
 # Policies And Template Mappings
 ##
 
@@ -1250,30 +1285,177 @@ class Zappa:
             Payload=payload
         )
 
-    def rollback_lambda_function_version(self, function_name, versions_back=1, publish=True):
+    # Configuration fields captured/restored by a full rollback.
+    CONFIGURATION_ROLLBACK_FIELDS = (
+        'Runtime', 'Role', 'Handler', 'Description', 'Timeout',
+        'MemorySize', 'VpcConfig', 'Environment', 'KMSKeyArn',
+        'TracingConfig', 'Layers', 'DeadLetterConfig',
+    )
+
+    def get_lambda_configuration_snapshot(self, function_name, qualifier=None):
+        """
+        Return a snapshot dict of the function's mutable configuration,
+        suitable for restoring with restore_lambda_configuration().
+
+        A snapshot can be taken against a published version by passing its
+        version number as `qualifier`.
+        """
+        kwargs = {'FunctionName': function_name}
+        if qualifier is not None:
+            kwargs['Qualifier'] = str(qualifier)
+        current = self.lambda_client.get_function_configuration(**kwargs)
+
+        snapshot = {}
+        for field in self.CONFIGURATION_ROLLBACK_FIELDS:
+            if field in current:
+                snapshot[field] = current[field]
+
+        # get_function_configuration returns full layer objects; the update
+        # API needs just the ARNs.
+        if 'Layers' in snapshot:
+            snapshot['Layers'] = [
+                layer['Arn'] for layer in snapshot['Layers']
+            ]
+
+        # VpcConfig returned by the read API carries extra status fields;
+        # the update API only accepts subnet/security-group ids.
+        vpc_config = snapshot.get('VpcConfig') or {}
+        snapshot['VpcConfig'] = {
+            'SubnetIds': list(vpc_config.get('SubnetIds', [])),
+            'SecurityGroupIds': list(vpc_config.get('SecurityGroupIds', [])),
+        }
+
+        # An absent KMS key must be sent as an empty string, otherwise the
+        # old key is retained.
+        snapshot['KMSKeyArn'] = (snapshot.get('KMSKeyArn') or '')
+
+        # Reserved concurrency is managed separately.
+        try:
+            concurrency = self.lambda_client.get_function_concurrency(
+                FunctionName=function_name)
+            snapshot['ReservedConcurrentExecutions'] = concurrency.get(
+                'ReservedConcurrentExecutions')
+        except ClientError:  # pragma: no cover
+            snapshot['ReservedConcurrentExecutions'] = None
+
+        return snapshot
+
+    def restore_lambda_configuration(self, function_name, snapshot):
+        """
+        Restore a Lambda function's configuration from a snapshot produced
+        by get_lambda_configuration_snapshot(). Returns the FunctionArn.
+        """
+        print("Restoring Lambda function configuration..")
+
+        kwargs = dict(
+            FunctionName=function_name,
+            Runtime=snapshot['Runtime'],
+            Role=snapshot.get('Role') or self.credentials_arn,
+            Handler=snapshot['Handler'],
+            Description=snapshot.get('Description', ''),
+            Timeout=snapshot.get('Timeout', 30),
+            MemorySize=snapshot.get('MemorySize', 512),
+            VpcConfig=snapshot.get('VpcConfig', {}),
+            Environment=snapshot.get('Environment', {'Variables': {}}),
+            KMSKeyArn=snapshot.get('KMSKeyArn', ''),
+            TracingConfig=snapshot.get('TracingConfig', {'Mode': 'PassThrough'}),
+            Layers=snapshot.get('Layers', []),
+        )
+        if snapshot.get('DeadLetterConfig'):
+            kwargs['DeadLetterConfig'] = snapshot['DeadLetterConfig']
+
+        response = self.lambda_client.update_function_configuration(**kwargs)
+
+        concurrency = snapshot.get('ReservedConcurrentExecutions')
+        if concurrency is not None:
+            self.lambda_client.put_function_concurrency(
+                FunctionName=function_name,
+                ReservedConcurrentExecutions=concurrency,
+            )
+        else:
+            self.lambda_client.delete_function_concurrency(
+                FunctionName=function_name,
+            )
+
+        return response['FunctionArn']
+
+    def rollback_lambda_function_version(self, function_name, versions_back=1,
+                                         publish=True,
+                                         restore_configuration=False):
         """
         Rollback the lambda function code 'versions_back' number of revisions.
 
-        Returns the Function ARN.
-        """
-        response = self.lambda_client.list_versions_by_function(FunctionName=function_name)
+        When restore_configuration is True, the function's configuration
+        (runtime, handler, memory, timeout, VPC, environment variables, KMS
+        key, tracing, layers, dead-letter config and reserved concurrency) is
+        also restored to whatever it was on the target revision, and a new
+        version containing the matching code+configuration is published.
 
-        # Take into account $LATEST
-        if len(response['Versions']) < versions_back + 1:
-            print("We do not have {} revisions. Aborting".format(str(versions_back)))
-            return False
+        Returns the Function ARN, or False if there are not enough revisions.
+        """
+        response = self.lambda_client.list_versions_by_function(
+            FunctionName=function_name)
 
         revisions = [int(revision['Version']) for revision in response['Versions'] if revision['Version'] != '$LATEST']
         revisions.sort(reverse=True)
 
-        response = self.lambda_client.get_function(FunctionName='function:{}:{}'.format(function_name, revisions[versions_back]))
-        response = requests.get(response['Code']['Location'])
-
-        if response.status_code != 200:
-            print("Failed to get version {} of {} code".format(versions_back, function_name))
+        # We need at least versions_back+1 published revisions to have a
+        # target to roll back to ($LATEST does not count).
+        if len(revisions) <= versions_back:
+            print("We do not have {} revisions. Aborting".format(str(versions_back)))
             return False
 
-        response = self.lambda_client.update_function_code(FunctionName=function_name, ZipFile=response.content, Publish=publish)  # pragma: no cover
+        target_version = revisions[versions_back]
+
+        # Capture the target revision's configuration before touching the
+        # function, so a rollback restores code and config together.
+        configuration_snapshot = None
+        if restore_configuration:
+            configuration_snapshot = self.get_lambda_configuration_snapshot(
+                function_name, qualifier=target_version)
+
+        response = self.lambda_client.get_function(
+            FunctionName='function:{}:{}'.format(function_name, target_version))
+        code_response = requests.get(response['Code']['Location'])
+
+        if code_response.status_code != 200:
+            print("Failed to get version {} of {} code".format(target_version, function_name))
+            return False
+
+        response = self.lambda_client.update_function_code(
+            FunctionName=function_name,
+            ZipFile=code_response.content,
+            Publish=False)
+
+        if restore_configuration and configuration_snapshot is not None:
+            self.restore_lambda_configuration(
+                function_name, configuration_snapshot)
+
+        # Keep the ALB alias pointing at the rolled-back version.
+        final_version = None
+        if publish:
+            published = self.lambda_client.publish_version(
+                FunctionName=function_name)
+            final_version = published['Version']
+            response = published
+
+            try:
+                self.lambda_client.get_alias(
+                    FunctionName=function_name,
+                    Name=ALB_LAMBDA_ALIAS,
+                )
+                alias_exists = True
+            except ClientError as ce:
+                if "ResourceNotFoundException" not in ce.response["Error"]["Code"]:
+                    raise
+                alias_exists = False
+
+            if alias_exists:
+                self.lambda_client.update_alias(
+                    FunctionName=function_name,
+                    FunctionVersion=final_version,
+                    Name=ALB_LAMBDA_ALIAS,
+                )
 
         return response['FunctionArn']
 
@@ -2537,6 +2719,188 @@ class Zappa:
         self.credentials_arn = role.arn
         return role, self.credentials_arn
 
+    def lambda_function_exists(self, function_name):
+        """
+        Return True if the named Lambda function exists and is reachable,
+        False otherwise.
+        """
+        try:
+            self.lambda_client.get_function_configuration(
+                FunctionName=function_name)
+            return True
+        except ClientError as ce:
+            error_code = ce.response.get('Error', {}).get('Code', '')
+            if error_code in ('ResourceNotFoundException',
+                              'ValidationException'):
+                return False
+            # A permissions/credentials problem is not the same as the
+            # function being absent - re-raise so the caller can surface it.
+            raise
+
+    def assert_lambda_function_exists(self, function_name):
+        """
+        Pre-flight check: verify the Lambda function we are about to
+        update/roll back actually exists. Raises LambdaFunctionNotFound.
+        """
+        if not self.lambda_function_exists(function_name):
+            raise LambdaFunctionNotFound(
+                "Lambda function '{}' could not be found in region '{}'. "
+                "Have you deployed it yet?".format(
+                    function_name, self.aws_region))
+        return True
+
+    def validate_iam_role(self, role_arn=None, required_actions=None):
+        """
+        Pre-flight check: ensure the Lambda *execution* role exists, can be
+        assumed by the Lambda service and grants the core actions Zappa
+        deployments need.
+
+        Raises IAMRoleValidationError if the role is missing or misconfigured.
+        Returns a list of warning strings for actions the simulator could not
+        prove (e.g. when the deploying credentials lack iam:SimulatePrincipalPolicy).
+        """
+        role_arn = role_arn or getattr(self, 'credentials_arn', None)
+        if not role_arn:
+            try:
+                _, role_arn = self.get_credentials_arn()
+            except ClientError as ce:
+                raise IAMRoleValidationError(
+                    "Cannot validate the IAM execution role: no role ARN was "
+                    "configured and none could be loaded ({})".format(ce))
+
+        if required_actions is None:
+            required_actions = [
+                'logs:CreateLogGroup',
+                'logs:CreateLogStream',
+                'logs:PutLogEvents',
+                'lambda:InvokeFunction',
+            ]
+
+        # 1. The role must exist.
+        try:
+            role = self.iam_client.get_role(
+                RoleName=role_arn.split('/')[-1])['Role']
+        except ClientError as ce:
+            raise IAMRoleValidationError(
+                "IAM execution role '{}' does not exist or is not accessible: "
+                "{}".format(role_arn, ce))
+
+        # 2. The Lambda service must be allowed to assume the role.
+        assume_doc = role.get('AssumeRolePolicyDocument', {})
+        principals = []
+        for statement in assume_doc.get('Statement', []):
+            if statement.get('Effect') != 'Allow':
+                continue
+            principal = statement.get('Principal', {})
+            if isinstance(principal, dict):
+                service_principal = principal.get('Service', [])
+                if isinstance(service_principal, str):
+                    service_principal = [service_principal]
+                principals.extend(service_principal)
+        if not any(p == 'lambda.amazonaws.com' or
+                   p.endswith('.lambda.amazonaws.com') for p in principals):
+            raise IAMRoleValidationError(
+                "IAM role '{}' cannot be assumed by the Lambda service "
+                "(lambda.amazonaws.com is missing from its trust policy). "
+                "Lambda creation/deployment would fail.".format(role_arn))
+
+        # 3. Verify the inline/attached policy actually grants the required
+        #    actions. The policy simulator is authoritative when available.
+        warnings = []
+        try:
+            simulated = self.iam_client.simulate_principal_policy(
+                PolicySourceArn=role_arn,
+                ActionNames=required_actions,
+                ResourceArns=['*'])
+            for result in simulated.get('EvaluationResults', []):
+                if result.get('EvalDecision') != 'allowed':
+                    raise IAMRoleValidationError(
+                        "IAM role '{}' is missing required permission '{}' "
+                        "(simulator decision: {}). Update the role's policy "
+                        "before deploying.".format(
+                            role_arn, result.get('EvalActionName'),
+                            result.get('EvalDecision')))
+        except ClientError as ce:
+            error_code = ce.response.get('Error', {}).get('Code', '')
+            if error_code in ('AccessDenied', 'UnauthorizedOperation',
+                              'NotAuthorizedException'):
+                # The *deploying* identity is not allowed to run the
+                # simulator - warn rather than block the deployment.
+                warnings.append(
+                    "Could not verify execution-role permissions via the IAM "
+                    "policy simulator ({}). Make sure the role '{}' grants: "
+                    "{}".format(error_code, role_arn,
+                                ', '.join(required_actions)))
+            else:
+                raise
+
+        return warnings
+
+    def validate_deployer_permissions(self, required_actions=None):
+        """
+        Pre-flight check: ensure the credentials doing the deploy are allowed
+        to perform the management actions the deployment will issue.
+
+        Missing permissions raise IAMRoleValidationError; an inability to
+        simulate returns a warning instead.
+        """
+        if required_actions is None:
+            required_actions = [
+                'lambda:CreateFunction',
+                'lambda:GetFunctionConfiguration',
+                'lambda:UpdateFunctionCode',
+                'lambda:UpdateFunctionConfiguration',
+                'lambda:PublishVersion',
+                'iam:PassRole',
+                's3:PutObject',
+                'cloudformation:CreateStack',
+                'cloudformation:DescribeStacks',
+                'apigateway:POST',
+            ]
+
+        try:
+            identity = self.sts_client.get_caller_identity()
+            identity_arn = identity['Arn']
+        except ClientError as ce:
+            raise IAMRoleValidationError(
+                "Could not determine the deploying AWS identity: {}".format(ce))
+
+        # SimulatePrincipalPolicy requires an IAM principal. For assumed roles
+        # /federated users fall back to a warning - the actual API calls will
+        # fail loudly anyway if permissions are lacking.
+        if ':user/' not in identity_arn and ':role/' not in identity_arn:
+            return [
+                "Deploying identity '{}' is not a plain IAM user/role ARN; "
+                "skipping deployer permission simulation. Required actions: "
+                "{}".format(identity_arn, ', '.join(required_actions))
+            ]
+
+        warnings = []
+        try:
+            simulated = self.iam_client.simulate_principal_policy(
+                PolicySourceArn=identity_arn,
+                ActionNames=required_actions,
+                ResourceArns=['*'])
+            for result in simulated.get('EvaluationResults', []):
+                if result.get('EvalDecision') != 'allowed':
+                    raise IAMRoleValidationError(
+                        "The deploying identity '{}' lacks required "
+                        "permission '{}' (simulator decision: {}). The "
+                        "deployment would fail part-way through.".format(
+                            identity_arn, result.get('EvalActionName'),
+                            result.get('EvalDecision')))
+        except ClientError as ce:
+            error_code = ce.response.get('Error', {}).get('Code', '')
+            if error_code in ('AccessDenied', 'UnauthorizedOperation',
+                              'NotAuthorizedException'):
+                warnings.append(
+                    "Could not verify deployer permissions via the IAM policy "
+                    "simulator ({}). Required actions: {}".format(
+                        error_code, ', '.join(required_actions)))
+            else:
+                raise
+        return warnings
+
     def create_iam_roles(self):
         """
         Create and defines the IAM roles and policies necessary for Zappa.
@@ -3014,6 +3378,199 @@ class Zappa:
         Remove the DynamoDB Table used for async return values
         """
         self.dynamodb_client.delete_table(TableName=table_name)
+
+    ##
+    # Deployment Locks (concurrent-deploy protection)
+    ##
+
+    def _ensure_deployment_lock_table(self):
+        """
+        Create the DynamoDB table that stores deployment locks if it does
+        not already exist. The table uses a TTL attribute so crashed
+        deployments cannot hold their locks forever.
+        """
+        table_name = DEPLOYMENT_LOCK_TABLE_NAME
+        try:
+            self.dynamodb_client.describe_table(TableName=table_name)
+            return
+        except ClientError as ce:
+            if ce.response.get('Error', {}).get('Code') != \
+                    'ResourceNotFoundException':
+                raise
+
+        self.dynamodb_client.create_table(
+            TableName=table_name,
+            AttributeDefinitions=[
+                {'AttributeName': 'lock_key', 'AttributeType': 'S'},
+            ],
+            KeySchema=[
+                {'AttributeName': 'lock_key', 'KeyType': 'HASH'},
+            ],
+            BillingMode='PAY_PER_REQUEST',
+            Tags=[{'Key': 'ManagedBy', 'Value': 'Zappa'}],
+        )
+        self.dynamodb_client.get_waiter('table_exists').wait(
+            TableName=table_name,
+            WaiterConfig={'Delay': 2, 'MaxAttempts': 30})
+        try:
+            self.dynamodb_client.update_time_to_live(
+                TableName=table_name,
+                TimeToLiveSpecification={
+                    'Enabled': True,
+                    'AttributeName': 'expires_at'
+                })
+        except ClientError:  # pragma: no cover
+            # TTL may already be enabled; the explicit expiry check on
+            # acquire still protects us.
+            pass
+
+    @staticmethod
+    def _deployment_lock_holder():
+        """Identify who holds a lock, for diagnostics and safe release."""
+        try:
+            hostname = os.uname()[1]
+        except AttributeError:  # pragma: no cover
+            import socket
+            hostname = socket.gethostname()
+        return '{}@{}'.format(getpass.getuser(), hostname)
+
+    def acquire_deployment_lock(self, lock_key,
+                                timeout=DEFAULT_DEPLOYMENT_LOCK_TIMEOUT,
+                                wait_seconds=0,
+                                poll_interval=5):
+        """
+        Acquire a distributed deployment lock for `lock_key`.
+
+        The lock is a conditional DynamoDB PutItem, so it is atomic across
+        regions/clients. An expired lock (crashed previous deployment) is
+        stolen. When wait_seconds > 0, poll until the lock is available or
+        the wait budget is exhausted.
+
+        Returns the holder string on success; raises DeploymentLockError if
+        the lock is held by someone else.
+        """
+        self._ensure_deployment_lock_table()
+        holder = self._deployment_lock_holder()
+        deadline = time.time() + max(0, wait_seconds)
+
+        while True:
+            now = int(time.time())
+            try:
+                # The condition fails if a non-expired lock row already
+                # exists for this key.
+                self.dynamodb_client.put_item(
+                    TableName=DEPLOYMENT_LOCK_TABLE_NAME,
+                    Item={
+                        'lock_key': {'S': lock_key},
+                        'holder': {'S': holder},
+                        'acquired_at': {'N': str(now)},
+                        'expires_at': {'N': str(now + int(timeout))},
+                    },
+                    ConditionExpression=(
+                        'attribute_not_exists(lock_key) OR '
+                        'expires_at < :now'),
+                    ExpressionAttributeValues={':now': {'N': str(now)}},
+                )
+                return holder
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != \
+                        'ConditionalCheckFailedException':
+                    raise
+
+                # Lock is held; find out by whom for a useful error message.
+                existing = self.dynamodb_client.get_item(
+                    TableName=DEPLOYMENT_LOCK_TABLE_NAME,
+                    Key={'lock_key': {'S': lock_key}},
+                ).get('Item', {})
+                other_holder = existing.get('holder', {}).get('S', 'unknown')
+                expires_at = int(existing.get('expires_at', {}).get('N', '0'))
+
+                if time.time() >= deadline:
+                    raise DeploymentLockError(
+                        "Another deployment is already in progress for "
+                        "'{}' (lock holder: {}, expires in {}s). Aborting to "
+                        "prevent parallel CloudFormation stacks and resource "
+                        "conflicts.".format(
+                            lock_key, other_holder,
+                            max(0, expires_at - now)))
+                time.sleep(poll_interval)
+
+    def release_deployment_lock(self, lock_key, holder=None):
+        """
+        Release a deployment lock, but only if this caller still owns it.
+        Never deletes a lock that a crashed deployment had and a new
+        deployment legitimately stole.
+        """
+        try:
+            self.dynamodb_client.delete_item(
+                TableName=DEPLOYMENT_LOCK_TABLE_NAME,
+                Key={'lock_key': {'S': lock_key}},
+                ConditionExpression='holder = :holder',
+                ExpressionAttributeValues={
+                    ':holder': {'S': holder or self._deployment_lock_holder()}},
+            )
+        except ClientError as ce:
+            if ce.response.get('Error', {}).get('Code') == \
+                    'ConditionalCheckFailedException':
+                # Lock expired and was taken over by someone else; leave it.
+                logger.warning("Deployment lock for '%s' is now owned by "
+                               "another holder; not releasing it.", lock_key)
+            else:
+                raise
+
+    ##
+    # Half-finished deployment cleanup
+    ##
+
+    def cleanup_failed_deployment(self, function_name,
+                                  created_lambda=False,
+                                  s3_keys=None,
+                                  bucket_name=None,
+                                  remove_stack=True):
+        """
+        Best-effort removal of resources left behind when a deployment fails
+        part-way through, so the next `zappa deploy` starts from a clean slate.
+
+        - removes the CloudFormation/API Gateway stack (if one was started)
+        - deletes the Lambda function, but only when this deployment created it
+        - removes uploaded S3 zip objects
+
+        Every individual cleanup failure is logged but does not mask the
+        original deployment error.
+        """
+        print("Deployment failed; cleaning up any half-finished resources..")
+
+        if remove_stack:
+            try:
+                deleted = self.delete_stack(function_name, wait=True)
+                if not deleted:
+                    logger.debug("No CloudFormation stack '%s' to clean up.",
+                                 function_name)
+            except Exception as stack_error:  # pragma: no cover
+                logger.error("Failed to remove half-finished stack '%s': %s",
+                             function_name, stack_error)
+
+        if created_lambda:
+            try:
+                self.lambda_client.delete_function(FunctionName=function_name)
+                print("Removed partially created Lambda function '{}'.".format(
+                    function_name))
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') != \
+                        'ResourceNotFoundException':
+                    logger.error(
+                        "Failed to remove partially created Lambda "
+                        "function '%s': %s", function_name, ce)
+
+        if s3_keys and bucket_name:
+            for key in s3_keys:
+                try:
+                    self.s3_client.delete_object(
+                        Bucket=bucket_name, Key=key)
+                except ClientError as s3_error:  # pragma: no cover
+                    logger.error(
+                        "Failed to remove uploaded S3 object s3://%s/%s: %s",
+                        bucket_name, key, s3_error)
 
     ##
     # CloudWatch Logging
