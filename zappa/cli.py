@@ -41,7 +41,8 @@ from click.globals import push_context
 from dateutil import parser
 from datetime import datetime, timedelta
 
-from .core import Zappa, logger, API_GATEWAY_REGIONS
+from .core import (Zappa, logger, API_GATEWAY_REGIONS,
+                   DEFAULT_DEPLOYMENT_LOCK_TTL, DeploymentLockError)
 from .utilities import (check_new_version_available, detect_django_settings,
                   detect_flask_apps, parse_s3_url, human_size,
                   validate_name, InvalidAwsLambdaName, get_venv_from_python_version,
@@ -684,6 +685,18 @@ class ZappaCLI:
 
     def deploy(self, source_zip=None):
         """
+        Deploy with the cross-machine deployment lock held, so two
+        concurrent deploys can never create two racing CloudFormation
+        stacks for the same stage.
+        """
+        self.acquire_deployment_lock_or_exit()
+        try:
+            self._deploy_locked(source_zip=source_zip)
+        finally:
+            self.release_deployment_lock()
+
+    def _deploy_locked(self, source_zip=None):
+        """
         Package your project, upload it to S3, register the Lambda function
         and create the API Gateway routes.
 
@@ -861,6 +874,16 @@ class ZappaCLI:
         click.echo(deployment_string)
 
     def update(self, source_zip=None, no_upload=False):
+        """
+        Update with the cross-machine deployment lock held.
+        """
+        self.acquire_deployment_lock_or_exit()
+        try:
+            self._update_locked(source_zip=source_zip, no_upload=no_upload)
+        finally:
+            self.release_deployment_lock()
+
+    def _update_locked(self, source_zip=None, no_upload=False):
         """
         Repackage and update the function code.
         """
@@ -1065,14 +1088,21 @@ class ZappaCLI:
 
     def rollback(self, revision):
         """
-        Rollsback the currently deploy lambda code to a previous revision.
+        Roll back the currently deployed Lambda to a previous revision.
+
+        Both the function code and its configuration are restored.
         """
 
         print("Rolling back..")
 
-        self.zappa.rollback_lambda_function_version(
+        arn = self.zappa.rollback_lambda_function_version(
             self.lambda_name, versions_back=revision)
-        print("Done!")
+        if arn:
+            print("Done! Rolled back code and configuration {} revision(s).".format(revision))
+        else:
+            click.echo(click.style("Rollback failed", fg="red", bold=True) +
+                       " - check the output above.")
+            sys.exit(-1)
 
     def tail(self, since, filter_pattern, limit=10000, keep_open=True, colorize=True, http=False, non_http=False, force_colorize=False):
         """
@@ -1109,6 +1139,17 @@ class ZappaCLI:
                 os._exit(130)
 
     def undeploy(self, no_confirm=False, remove_logs=False):
+        """
+        Tear down an existing deployment, holding the deployment lock so the
+        stack cannot be deleted while another deploy/update is in flight.
+        """
+        self.acquire_deployment_lock_or_exit()
+        try:
+            self._undeploy_locked(no_confirm=no_confirm, remove_logs=remove_logs)
+        finally:
+            self.release_deployment_lock()
+
+    def _undeploy_locked(self, no_confirm=False, remove_logs=False):
         """
         Tear down an existing deployment.
         """
@@ -2134,6 +2175,13 @@ class ZappaCLI:
                         setting_val = f.read()
                 setattr(self.zappa, setting, setting_val)
 
+        # Cross-machine S3 deployment lock, enabled by default. Set
+        # `deployment_lock: false` in zappa_settings to disable it and
+        # `deployment_lock_ttl` (seconds) to tune stale-lock takeover.
+        self.zappa.deployment_lock_enabled = self.stage_config.get('deployment_lock', True)
+        self.zappa.deployment_lock_ttl = self.stage_config.get(
+            'deployment_lock_ttl', DEFAULT_DEPLOYMENT_LOCK_TTL)
+
         if self.app_function:
             self.collision_warning(self.app_function)
             if self.app_function[-3:] == '.py':
@@ -2658,13 +2706,12 @@ class ZappaCLI:
                            "! You may want to rename that file.")
 
     def deploy_api_gateway(self, api_id):
-        cache_cluster_enabled = self.stage_config.get('cache_cluster_enabled', False)
-        cache_cluster_size = str(self.stage_config.get('cache_cluster_size', .5))
         endpoint_url = self.zappa.deploy_api_gateway(
             api_id=api_id,
             stage_name=self.api_stage,
-            cache_cluster_enabled=cache_cluster_enabled,
-            cache_cluster_size=cache_cluster_size,
+            function_name=self.lambda_name,
+            cache_cluster_enabled=self.stage_config.get('cache_cluster_enabled', False),
+            cache_cluster_size=str(self.stage_config.get('cache_cluster_size', .5)),
             cloudwatch_log_level=self.stage_config.get('cloudwatch_log_level', 'OFF'),
             cloudwatch_data_trace=self.stage_config.get('cloudwatch_data_trace', False),
             cloudwatch_metrics_enabled=self.stage_config.get('cloudwatch_metrics_enabled', False),
@@ -2672,6 +2719,39 @@ class ZappaCLI:
             cache_cluster_encrypted=self.stage_config.get('cache_cluster_encrypted', False)
         )
         return endpoint_url
+
+    ##
+    # Deployment Lock
+    ##
+
+    def acquire_deployment_lock_or_exit(self):
+        """
+        Acquire the S3 deployment lock for the current function/stage.
+
+        Aborts the command (instead of racing the CloudFormation stack) if
+        another deployment is already in progress.
+        """
+        if not self.zappa.deployment_lock_enabled:
+            return
+        try:
+            self.zappa.acquire_deployment_lock(
+                bucket_name=self.s3_bucket_name,
+                function_name=self.lambda_name,
+            )
+        except DeploymentLockError as e:
+            click.echo(click.style("Deployment locked", fg="red", bold=True) + ": " + str(e))
+            sys.exit(-1)
+
+    def release_deployment_lock(self):
+        """
+        Release the deployment lock acquired for this run, if any.
+        """
+        if not self.zappa.deployment_lock_enabled:
+            return
+        self.zappa.release_deployment_lock(
+            bucket_name=self.s3_bucket_name,
+            function_name=self.lambda_name,
+        )
 
     def check_venv(self):
         """ Ensure we're inside a virtualenv. """

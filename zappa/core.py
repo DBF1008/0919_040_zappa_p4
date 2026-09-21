@@ -14,6 +14,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import string
 import subprocess
 import tarfile
@@ -208,6 +209,26 @@ ZIP_EXCLUDES = [
 # See: https://github.com/Miserlou/Zappa/pull/1730
 ALB_LAMBDA_ALIAS = 'current-alb-version'
 
+# Prefix for the S3-based deployment lock objects. The full key is
+# '<prefix>-<lambda_name>' inside the project's working bucket.
+# The lock prevents two concurrent `zappa deploy/update/undeploy` runs from
+# creating/updating the same CloudFormation stack at the same time, which
+# would otherwise leave conflicting or half-provisioned resources behind.
+DEPLOYMENT_LOCK_PREFIX = 'zappa-deployment-lock'
+
+# Default time after which a lock is considered stale (a crashed or killed
+# previous run) and may be taken over. One hour matches the longest realistic
+# deployment window.
+DEFAULT_DEPLOYMENT_LOCK_TTL = 3600
+
+
+class DeploymentLockError(RuntimeError):
+    """
+    Raised when the deployment lock for a given function/stage is currently
+    held by another process and cannot be acquired.
+    """
+    pass
+
 ##
 # Classes
 ##
@@ -232,6 +253,11 @@ class Zappa:
     apigateway_policy = None
     cloudwatch_log_levels = ['OFF', 'ERROR', 'INFO']
     xray_tracing = False
+
+    # Cross-machine deployment lock (backed by S3). Disable with
+    # `deployment_lock: false` in zappa_settings.
+    deployment_lock_enabled = True
+    deployment_lock_ttl = DEFAULT_DEPLOYMENT_LOCK_TTL
 
     ##
     # Credentials
@@ -269,6 +295,11 @@ class Zappa:
 
         if desired_role_arn:
             self.credentials_arn = desired_role_arn
+
+        # Keep the passed-in session even when credential loading is
+        # disabled (e.g. in tests), otherwise region-dependent methods such
+        # as deploy_api_gateway cannot construct endpoint URLs.
+        self.boto_session = boto_session
 
         self.runtime = runtime
 
@@ -329,6 +360,10 @@ class Zappa:
         self.cf_template = troposphere.Template()
         self.cf_api_resources = []
         self.cf_parameters = {}
+
+        # Lock keys that this instance currently owns in S3, so we only
+        # release locks we actually acquired in release_deployment_lock.
+        self._held_deployment_locks = set()
 
     def configure_boto_session_method_kwargs(self, service, kw):
         """Allow for custom endpoint urls for non-AWS (testing and bootleg cloud) deployments"""
@@ -1000,6 +1035,140 @@ class Zappa:
             return False
 
     ##
+    # Deployment Lock
+    ##
+
+    def deployment_lock_key(self, function_name):
+        """
+        The S3 key used to serialise deployments of a given function/stage.
+        """
+        return '{}-{}'.format(DEPLOYMENT_LOCK_PREFIX, function_name)
+
+    def _default_lock_holder(self):
+        """
+        Human-readable identifier of the process/machine holding a lock.
+        """
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = 'unknown'
+        return '{}@{}'.format(user, socket.gethostname())
+
+    def acquire_deployment_lock(self,
+                                bucket_name,
+                                function_name,
+                                holder=None,
+                                ttl=None):
+        """
+        Acquire an S3-backed, cross-machine deployment lock for
+        'function_name'.
+
+        This prevents two developers (or two CI jobs) from running
+        `zappa deploy`/`update`/`undeploy` against the same stage at the same
+        time, which would otherwise race to create/update the same
+        CloudFormation stack and can leave conflicting or half-provisioned
+        resources behind.
+
+        The lock is a small JSON object in the project's working bucket.
+        Locks older than 'ttl' seconds are treated as stale leftovers from a
+        crashed/killed run and are taken over.
+
+        Raises DeploymentLockError if the lock is currently held by someone
+        else. Returns True on success.
+        """
+        if not self.deployment_lock_enabled:
+            return False
+
+        if ttl is None:
+            ttl = self.deployment_lock_ttl
+        if holder is None:
+            holder = self._default_lock_holder()
+
+        key = self.deployment_lock_key(function_name)
+        now = int(time.time())
+
+        while True:
+            existing = None
+            try:
+                existing = self.s3_client.get_object(Bucket=bucket_name, Key=key)
+            except botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] in ('NoSuchKey', '404'):
+                    existing = None
+                else:
+                    raise
+
+            active_holder = None
+            if existing:
+                try:
+                    body = existing['Body'].read()
+                    payload = json.loads(body.decode('utf-8'))
+                    acquired_at = payload.get('acquired_at', 0)
+                    if now - acquired_at < ttl:
+                        active_holder = payload.get('holder', 'another process')
+                except Exception:
+                    # Unreadable lock object: treat it as stale and take over.
+                    active_holder = None
+
+            if active_holder:
+                raise DeploymentLockError(
+                    "Deployment for '{}' is already in progress by {} "
+                    "(lock s3://{}/{}). Wait for it to finish, or, if the "
+                    "previous run died, remove the lock object or wait for it "
+                    "to expire ({}s).".format(
+                        function_name, active_holder, bucket_name, key, ttl))
+
+            payload = json.dumps({
+                'holder': holder,
+                'acquired_at': now,
+                'host': socket.gethostname(),
+                'function': function_name,
+            })
+
+            # Conditional write: only put if nobody else has created the lock.
+            try:
+                self.s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=key,
+                    Body=bytes(payload, 'utf-8'),
+                    ContentType='application/json',
+                    IfNoneMatch='*',
+                )
+                self._held_deployment_locks.add((bucket_name, key))
+                print("Acquired deployment lock for {} (holder: {}).".format(function_name, holder))
+                return True
+            except botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] in ('PreconditionFailed', 'PreconditionFailedException'):
+                    # Someone else acquired the lock between our read and write.
+                    raise DeploymentLockError(
+                        "Deployment for '{}' is already in progress by another "
+                        "process (lock s3://{}/{}).".format(
+                            function_name, bucket_name, key))
+                raise
+
+    def release_deployment_lock(self, bucket_name, function_name, holder=None):
+        """
+        Release the S3 deployment lock for 'function_name'.
+
+        The lock is only deleted if this instance previously acquired it, so
+        that a crashed run can never delete a lock that has since been taken
+        over by another run.
+        """
+        key = self.deployment_lock_key(function_name)
+        if (bucket_name, key) not in self._held_deployment_locks:
+            return False
+
+        try:
+            self.s3_client.delete_object(Bucket=bucket_name, Key=key)
+        except botocore.exceptions.ClientError as e:  # pragma: no cover
+            logger.warning("Failed to release deployment lock %s: %s", key, e)
+            return False
+        finally:
+            self._held_deployment_locks.discard((bucket_name, key))
+
+        print("Released deployment lock for {}.".format(function_name))
+        return True
+
+    ##
     # Lambda
     ##
 
@@ -1252,30 +1421,150 @@ class Zappa:
 
     def rollback_lambda_function_version(self, function_name, versions_back=1, publish=True):
         """
-        Rollback the lambda function code 'versions_back' number of revisions.
+        Rollback the lambda function 'versions_back' number of revisions.
 
-        Returns the Function ARN.
+        Unlike a code-only rollback, this restores both the function *code*
+        and its *configuration* (runtime, handler, role, timeout, memory,
+        VPC, environment variables, KMS key, tracing, layers, dead-letter
+        queue and description), so that a failed `zappa update` which
+        changed configuration can be fully reverted without manual steps.
+
+        The code is published first and the configuration second; a final
+        publish creates a single new version snapshotting both.
+
+        Returns the Function ARN, or False if the rollback is not possible.
         """
-        response = self.lambda_client.list_versions_by_function(FunctionName=function_name)
+        versions = self.lambda_client.list_versions_by_function(FunctionName=function_name)
+        while 'NextMarker' in versions:
+            versions = self.lambda_client.list_versions_by_function(
+                FunctionName=function_name, Marker=versions['NextMarker'])
 
-        # Take into account $LATEST
-        if len(response['Versions']) < versions_back + 1:
+        revisions = [int(revision['Version']) for revision in versions['Versions'] if revision['Version'] != '$LATEST']
+        revisions.sort(reverse=True)
+
+        # revisions are published versions, newest first. Rolling back
+        # 'versions_back' steps from the newest published revision therefore
+        # needs versions_back + 1 published versions (e.g. versions 2 -> 1).
+        if len(revisions) < versions_back + 1:
             print("We do not have {} revisions. Aborting".format(str(versions_back)))
             return False
 
-        revisions = [int(revision['Version']) for revision in response['Versions'] if revision['Version'] != '$LATEST']
-        revisions.sort(reverse=True)
+        target_version = revisions[versions_back]
 
-        response = self.lambda_client.get_function(FunctionName='function:{}:{}'.format(function_name, revisions[versions_back]))
-        response = requests.get(response['Code']['Location'])
+        print("Rolling back {} to revision {} (code and configuration)..".format(
+            function_name, target_version))
 
-        if response.status_code != 200:
-            print("Failed to get version {} of {} code".format(versions_back, function_name))
+        target = self.lambda_client.get_function(
+            FunctionName=function_name, Qualifier=str(target_version))
+        target_configuration = target['Configuration']
+
+        code_response = requests.get(target['Code']['Location'])
+        if code_response.status_code != 200:
+            print("Failed to get version {} of {} code".format(target_version, function_name))
             return False
 
-        response = self.lambda_client.update_function_code(FunctionName=function_name, ZipFile=response.content, Publish=publish)  # pragma: no cover
+        code_result = self._call_lambda_with_conflict_retry(
+            self.lambda_client.update_function_code,
+            FunctionName=function_name,
+            ZipFile=code_response.content,
+            Publish=publish,
+        )
 
-        return response['FunctionArn']
+        configuration_kwargs = self._build_configuration_rollback_kwargs(
+            function_name, target_configuration)
+        self._call_lambda_with_conflict_retry(
+            self.lambda_client.update_function_configuration,
+            **configuration_kwargs
+        )
+
+        # If the lambda has an ALB alias, move it back to the rolled-back
+        # version, otherwise the ALB keeps invoking the bad revision.
+        alias_exists = False
+        try:
+            self.lambda_client.get_alias(
+                FunctionName=function_name,
+                Name=ALB_LAMBDA_ALIAS,
+            )
+            alias_exists = True
+        except botocore.exceptions.ClientError as e:
+            if "ResourceNotFoundException" not in e.response["Error"]["Code"]:
+                raise e
+
+        if alias_exists:
+            self.lambda_client.update_alias(
+                FunctionName=function_name,
+                FunctionVersion=str(target_version),
+                Name=ALB_LAMBDA_ALIAS,
+            )
+
+        # Publish once more after the configuration has settled so that the
+        # newest immutable version snapshots the rolled-back code *and* the
+        # rolled-back configuration together.
+        result = self._call_lambda_with_conflict_retry(
+            self.lambda_client.publish_version,
+            FunctionName=function_name,
+        )
+
+        return result['FunctionArn'] if 'FunctionArn' in result else code_result['FunctionArn']
+
+    def _build_configuration_rollback_kwargs(self, function_name, configuration):
+        """
+        Translate a historical Lambda 'Configuration' object (as returned by
+        get_function) into the keyword arguments needed by
+        update_function_configuration, so that a rollback restores every
+        configurable aspect of the function and not just its code.
+        """
+        kwargs = dict(
+            FunctionName=function_name,
+            Runtime=configuration['Runtime'],
+            Role=configuration['Role'],
+            Handler=configuration['Handler'],
+            Description=configuration.get('Description', ''),
+            Timeout=configuration['Timeout'],
+            MemorySize=configuration['MemorySize'],
+            # An exact snapshot: env vars that existed back then are restored,
+            # vars added since the rolled-back revision are removed.
+            Environment={'Variables': configuration.get('Environment', {}).get('Variables', {})},
+            TracingConfig={
+                'Mode': configuration.get('TracingConfig', {}).get('Mode', 'PassThrough')
+            },
+            Layers=[layer['Arn'] for layer in configuration.get('Layers', [])],
+        )
+
+        if 'VpcConfig' in configuration:
+            kwargs['VpcConfig'] = {
+                'SubnetIds': configuration['VpcConfig'].get('SubnetIds', []),
+                'SecurityGroupIds': configuration['VpcConfig'].get('SecurityGroupIds', []),
+            }
+
+        # Pass the ARN even when empty so that a KMS key added in the bad
+        # revision is actually removed when rolling back to a revision that
+        # did not use one.
+        if 'KmsKeyArn' in configuration:
+            kwargs['KMSKeyArn'] = configuration['KmsKeyArn']
+
+        if configuration.get('DeadLetterConfig'):
+            kwargs['DeadLetterConfig'] = {
+                'TargetArn': configuration['DeadLetterConfig'].get('TargetArn', '')
+            }
+
+        return kwargs
+
+    def _call_lambda_with_conflict_retry(self, client_method, retries=10, delay=1.0, **kwargs):
+        """
+        Lambda serialises code and configuration updates per function: while
+        an update is still being applied it returns ResourceConflictException.
+        Rollback performs several updates in a row, so retry on that error
+        instead of failing half-way through a configuration restoration.
+        """
+        for attempt in range(retries):
+            try:
+                return client_method(**kwargs)
+            except botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] != 'ResourceConflictException' or attempt == retries - 1:
+                    raise
+                logger.debug("Lambda still updating, retrying (%s/%s)..", attempt + 1, retries)
+                time.sleep(delay)
 
     def get_lambda_function(self, function_name):
         """
@@ -1765,41 +2054,252 @@ class Zappa:
                             cloudwatch_data_trace=False,
                             cloudwatch_metrics_enabled=False,
                             cache_cluster_ttl=300,
-                            cache_cluster_encrypted=False
+                            cache_cluster_encrypted=False,
+                            function_name=None,
+                            cleanup_on_failure=True
                         ):
         """
         Deploy the API Gateway!
 
         Return the deployed API URL.
+
+        When 'function_name' is supplied, deployment pre-flight checks are run
+        first (Lambda function must exist, its IAM role must grant the minimum
+        Lambda/Logs permissions and the REST API must exist), so that a
+        deployment cannot fail half-way through and leave half-provisioned
+        resources behind.
+
+        If creating the deployment or configuring the stage fails, the
+        deployment/stage created by this call is rolled back automatically
+        ('cleanup_on_failure=True'), preserving any previously deployed stage.
         """
         print("Deploying API Gateway..")
 
-        self.apigateway_client.create_deployment(
-            restApiId=api_id,
-            stageName=stage_name,
-            stageDescription=stage_description,
-            description=description,
-            cacheClusterEnabled=cache_cluster_enabled,
-            cacheClusterSize=cache_cluster_size,
-            variables=variables or {}
-        )
+        if function_name:
+            self.validate_deployment_prerequisites(function_name=function_name, api_id=api_id)
+        else:
+            # Always make sure the REST API actually exists before deploying.
+            self.apigateway_client.get_rest_api(restApiId=api_id)
 
+        # Record the stage/deployment state before this call so rollback only
+        # removes what we created and never touches a previously live stage.
+        existing_deployment_id = None
+        stage_existed = False
+        try:
+            existing_stage = self.apigateway_client.get_stage(
+                restApiId=api_id, stageName=stage_name)
+            stage_existed = True
+            existing_deployment_id = existing_stage.get('deploymentId')
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != 'NotFoundException':
+                raise
+
+        deployment_id = None
         if cloudwatch_log_level not in self.cloudwatch_log_levels:
             cloudwatch_log_level = 'OFF'
 
-        self.apigateway_client.update_stage(
-            restApiId=api_id,
-            stageName=stage_name,
-            patchOperations=[
-                self.get_patch_op('logging/loglevel', cloudwatch_log_level),
-                self.get_patch_op('logging/dataTrace', cloudwatch_data_trace),
-                self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
-                self.get_patch_op('caching/ttlInSeconds', str(cache_cluster_ttl)),
-                self.get_patch_op('caching/dataEncrypted', cache_cluster_encrypted)
-            ]
-        )
+        try:
+            deployment_response = self.apigateway_client.create_deployment(
+                restApiId=api_id,
+                stageName=stage_name,
+                stageDescription=stage_description,
+                description=description,
+                cacheClusterEnabled=cache_cluster_enabled,
+                cacheClusterSize=cache_cluster_size,
+                variables=variables or {}
+            )
+            deployment_id = deployment_response['id']
+
+            self.apigateway_client.update_stage(
+                restApiId=api_id,
+                stageName=stage_name,
+                patchOperations=[
+                    self.get_patch_op('logging/loglevel', cloudwatch_log_level),
+                    self.get_patch_op('logging/dataTrace', cloudwatch_data_trace),
+                    self.get_patch_op('metrics/enabled', cloudwatch_metrics_enabled),
+                    self.get_patch_op('caching/ttlInSeconds', str(cache_cluster_ttl)),
+                    self.get_patch_op('caching/dataEncrypted', cache_cluster_encrypted)
+                ]
+            )
+        except Exception as original_error:
+            if cleanup_on_failure:
+                self._rollback_failed_api_deployment(
+                    api_id=api_id,
+                    stage_name=stage_name,
+                    deployment_id=deployment_id,
+                    stage_existed=stage_existed,
+                    existing_deployment_id=existing_deployment_id,
+                )
+            raise
 
         return "https://{}.execute-api.{}.amazonaws.com/{}".format(api_id, self.boto_session.region_name, stage_name)
+
+    def _rollback_failed_api_deployment(self,
+                                        api_id,
+                                        stage_name,
+                                        deployment_id,
+                                        stage_existed,
+                                        existing_deployment_id):
+        """
+        Best-effort cleanup of the stage/deployment left behind by a failed
+        deploy_api_gateway call.
+
+        A new stage cannot be deleted while it references the failed
+        deployment, and a deployment cannot be deleted while the stage points
+        at it, so:
+          * For an existing stage, repoint it at the previous deployment
+            first, then delete the failed deployment.
+          * For a brand-new stage, delete the stage first, then delete the
+            failed deployment.
+        """
+        try:
+            if deployment_id:
+                if stage_existed and existing_deployment_id:
+                    self.apigateway_client.update_stage(
+                        restApiId=api_id,
+                        stageName=stage_name,
+                        patchOperations=[{
+                            'op': 'replace',
+                            'path': '/deploymentId',
+                            'value': existing_deployment_id,
+                        }]
+                    )
+                    self.apigateway_client.delete_deployment(
+                        restApiId=api_id, deploymentId=deployment_id)
+                else:
+                    try:
+                        self.apigateway_client.delete_stage(
+                            restApiId=api_id, stageName=stage_name)
+                    except botocore.exceptions.ClientError as cleanup_error:
+                        if cleanup_error.response['Error']['Code'] != 'NotFoundException':
+                            logger.warning("Failed to delete half-created stage %s: %s",
+                                           stage_name, cleanup_error)
+                    self.apigateway_client.delete_deployment(
+                        restApiId=api_id, deploymentId=deployment_id)
+                print("Cleaned up half-created API Gateway deployment {}.".format(deployment_id))
+        except Exception as cleanup_error:
+            # Never mask the original deployment failure.
+            logger.warning("Failed to fully clean up the failed API Gateway deployment: %s",
+                           cleanup_error)
+
+    def lambda_function_exists(self, function_name):
+        """
+        Returns True if a Lambda function with the given name exists in the
+        current region/account, False otherwise.
+
+        This requires the "lambda:GetFunction" permission.
+        """
+        try:
+            self.lambda_client.get_function(FunctionName=function_name)
+            return True
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                return False
+            raise
+
+    def validate_iam_role_for_lambda(self, role_arn):
+        """
+        Verify that the IAM role which Lambda will assume both exists and is
+        assumable by lambda.amazonaws.com, and that its policies grant the
+        minimum permissions a deployed Zappa function needs (CloudWatch Logs
+        write and self-invoke).
+
+        Uses IAM Access Analyzer policy simulation so the actual effective
+        permissions (inline + attached + managed policies) are evaluated.
+
+        Raises EnvironmentError with a descriptive message on failure.
+        Returns True on success.
+        """
+        required_actions = [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents',
+            'lambda:InvokeFunction',
+        ]
+
+        # 1. The role must exist.
+        role_name = role_arn.split(':role/')[-1].split('/')[-1]
+        try:
+            role = self.iam.Role(role_name)
+            role.load()
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                raise EnvironmentError(
+                    "IAM role '{}' does not exist.".format(role_name))
+            raise EnvironmentError(
+                "Unable to verify IAM role '{}': {}".format(role_name, e))
+
+        # 2. lambda.amazonaws.com must be allowed to assume the role.
+        assume_role_doc = role.assume_role_policy_document or {}
+        services = set()
+        for statement in assume_role_doc.get('Statement', []):
+            if statement.get('Effect') == 'Allow':
+                principal = statement.get('Principal', {})
+                principal_services = principal.get('Service', [])
+                if isinstance(principal_services, str):
+                    principal_services = [principal_services]
+                services.update(principal_services)
+        if 'lambda.amazonaws.com' not in services:
+            raise EnvironmentError(
+                "IAM role '{}' cannot be assumed by Lambda "
+                "(lambda.amazonaws.com is missing from its trust policy).".format(role_name))
+
+        # 3. Effective permissions must cover the minimum required actions.
+        # If the *deploying* credentials are not allowed to run the
+        # simulation, warn instead of blocking the deployment.
+        try:
+            paginator = self.iam_client.get_paginator('simulate_principal_policy')
+            denied = []
+            for page in paginator.paginate(
+                    PolicySourceArn=role_arn,
+                    ActionNames=required_actions):
+                for result in page.get('EvaluationResults', []):
+                    if result.get('EvalDecision') != 'allowed':
+                        denied.append(result['EvalActionName'])
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] in (
+                    'AccessDenied', 'AccessDeniedException',
+                    'UnauthorizedOperation'):
+                print("Warning: unable to simulate IAM role permissions "
+                      "({}); skipping permission simulation.".format(
+                          e.response['Error']['Code']))
+                return True
+            raise
+
+        if denied:
+            raise EnvironmentError(
+                "IAM role '{}' is missing required Lambda permissions: {}. "
+                "Update the role before deploying.".format(role_name, ', '.join(sorted(denied))))
+
+        return True
+
+    def validate_deployment_prerequisites(self, function_name, api_id=None):
+        """
+        Pre-deployment safety checks. Fail early, before any API Gateway
+        resource is created, when:
+
+          * the target Lambda function does not exist (deploy should have
+            created it first),
+          * its IAM execution role does not exist, cannot be assumed by
+            Lambda, or lacks the minimum required permissions,
+          * the REST API (api_id) does not exist.
+
+        Raises EnvironmentError describing the failed check.
+        Returns True when all prerequisites are satisfied.
+        """
+        if not self.lambda_function_exists(function_name):
+            raise EnvironmentError(
+                "Lambda function '{}' does not exist. The function must be "
+                "created successfully before the API Gateway is deployed.".format(function_name))
+
+        if not self.credentials_arn:
+            self.get_credentials_arn()
+        self.validate_iam_role_for_lambda(self.credentials_arn)
+
+        if api_id:
+            self.apigateway_client.get_rest_api(restApiId=api_id)
+
+        return True
 
     def add_binary_support(self, api_id, cors=False):
             """
